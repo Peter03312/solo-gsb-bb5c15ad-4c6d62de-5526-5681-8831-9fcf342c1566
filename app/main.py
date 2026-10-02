@@ -76,6 +76,9 @@
   IMMEDIATE 已提交顺序产生唯一结果（轮换先提交则持旧密钥的确认/撤回 401
   回滚，不产生资料或封存审计）；后台扫描器与每个提案写事务/提案查询都做
   确定性到期判定，停机期间到期在重启恢复扫描时补结算。
+  发起/确认/撤回的截止判定以取得写锁后的实际时刻为准：等待写锁期间越过
+  截止时刻的，发起沿用 400 且不落提案，确认/撤回先使提案失效并清空正文
+  再沿用 409，不计新票、不生成资料或封存审计。
 - 每次操作按顺序追加到 audit_log，SQLite 持久化，重启后状态一致。
 - 站内通知：资料开封（opened）或到期清除（purged）时，在状态变更的同一写
   事务内向“当时封存人 + 三名见证人”各记一条；见证人替换（witness_replaced）
@@ -930,6 +933,15 @@ def seal_document(
 # 失效或完成后立即清空提案正文。确认/撤回/到期与密钥轮换按写锁已提交
 # 顺序产生唯一结果；后台扫描器、每个提案写事务与提案查询都做确定性到期
 # 判定，停机期间到期在重启恢复扫描时补结算。
+#
+# 截止判定以取得写事务后的实际时刻为准：发起、确认、撤回都可能在截止前
+# 到达、等待写锁期间越过截止时刻。为此三个写接口都在 BEGIN IMMEDIATE
+# 取锁（并先在锁内复核当前密钥）之后才取“当前时刻”做判定——
+#   发起：取锁时截止已过则沿用 400 拒绝并整体回滚，不落提案；
+#   确认/撤回：取锁时截止已过则先把待处理提案确定性失效并清空正文，
+#     再沿用 409 拒绝，不计新票、不生成资料或封存审计；
+# 截止前取得写锁的有效第三票仍在同一事务内生成唯一资料，记录的完成时刻
+# 即取锁后的实际时刻。
 # ---------------------------------------------------------------------------
 
 
@@ -1036,11 +1048,16 @@ def create_pre_seal_proposal(
         raise err(400, "封存人不能同时担任见证人")
 
     deadline = utc_str(payload.confirm_deadline)
-    now = utc_str(now_utc())
-    if deadline <= now:
+    # 锁外快速预检；权威判定在写事务内以取得写锁后的实际时刻复核（见下）。
+    if deadline <= utc_str(now_utc()):
         raise err(400, "确认截止时刻必须晚于当前时间")
 
     with authed_write_tx(db, user) as tx:
+        # 截止判定以取得写锁后的实际时刻为准：截止前发起、但等待写锁期间
+        # 越过截止时刻的请求，沿用 400 拒绝并整体回滚，不落提案。
+        now = utc_str(now_utc())
+        if deadline <= now:
+            raise err(400, "确认截止时刻必须晚于当前时间")
         placeholders = ",".join("?" for _ in payload.witnesses)
         witness_rows = tx.execute(
             f"SELECT id, username FROM users WHERE username IN ({placeholders})",
@@ -1122,13 +1139,16 @@ def confirm_pre_seal_proposal(
     if is_witness is None:
         raise err(403, "只有受邀见证人可以确认预封存提案")
 
-    now = utc_str(now_utc())
     # 到期若在本临界区内生效，失效先落库（清空正文），拒绝在提交后再返回，
     # 不能让回滚撤销已生效的到期判定（与同意/撤销开封请求同一语义）。
     post_commit_error: HTTPException | None = None
     result: dict[str, Any] | None = None
     try:
         with authed_write_tx(db, user) as tx:
+            # 截止判定以取得写锁后的实际时刻为准：截止前发起、但等待写锁期间
+            # 越过截止时刻的确认，先把提案确定性失效并清空正文，再沿用 409
+            # 拒绝——不计新票、不生成资料或封存审计。
+            now = utc_str(now_utc())
             expired_here = expire_due_pre_seal_proposals(tx, now, proposal_id) > 0
 
             prop = tx.execute(
@@ -1235,10 +1255,12 @@ def revoke_pre_seal_proposal(
     if prop is None or prop["owner_id"] != user["id"]:
         raise err(403, "无权操作该预封存提案或提案不存在")
 
-    now = utc_str(now_utc())
     post_commit_error: HTTPException | None = None
     result: dict[str, Any] | None = None
     with authed_write_tx(db, user) as tx:
+        # 截止判定以取得写锁后的实际时刻为准：截止前发起、但等待写锁期间
+        # 越过截止时刻的撤回，先把提案确定性失效并清空正文，再沿用 409 拒绝。
+        now = utc_str(now_utc())
         expired_here = expire_due_pre_seal_proposals(tx, now, proposal_id) > 0
 
         prop = tx.execute(

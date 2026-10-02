@@ -10,6 +10,9 @@
   已完成提案重复请求不再生成资料；
 - 完成前撤回、到期未集齐失效；撤回/失效/完成后提案正文清空；
 - 密钥轮换并发：轮换先提交则持旧密钥的确认/撤回 401 回滚，不产生资料；
+- 截止判定以取得写锁后的实际时刻为准：发起/确认/撤回在截止前到达、
+  等待写锁期间越过截止时刻的，发起 400 不落提案，确认/撤回先失效清正文
+  再 409，不计票、不生成资料；截止前取得写锁的第三票仍同事务生成唯一资料；
 - 真实 uvicorn + 多线程：第三票并发只生成一份资料；停机期间到期重启恢复。
 """
 import datetime as dt
@@ -19,6 +22,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 import httpx
 import pytest
@@ -726,3 +730,177 @@ def test_expired_during_downtime_recovered_on_restart(tmp_path, monkeypatch):
     finally:
         server2.should_exit = True
         thread2.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# 截止判定以取得写锁后的实际时刻为准（等待写锁期间越过截止时刻）
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def held_write_lock():
+    """在测试进程内占用同一数据库文件的写锁，模拟“请求已到达、等待写锁”的窗口。
+
+    占用期间发起的提案写请求会阻塞在 BEGIN IMMEDIATE；释放写锁后，被阻塞的
+    请求必须以“取得写锁后的实际时刻”做截止判定，而不是用到达时刻。
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(os.environ["SEAL_DB_PATH"], timeout=30.0)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+@pytest.fixture
+def no_sweeper(monkeypatch):
+    """停用后台扫描器：确保越过截止时刻的结算由被测请求自身在取锁后完成。"""
+    from app.main import ExpirySweeper
+
+    monkeypatch.setattr(ExpirySweeper, "sweep_once", staticmethod(lambda: 0))
+    time.sleep(0.2)  # 让进行中的扫描收尾（测试扫描间隔 0.05s）
+
+
+def test_create_waiting_past_deadline_rejected_without_proposal(
+    client, five_users, no_sweeper
+):
+    """发起在截止前到达、取得写锁时截止已过：沿用 400 拒绝且不落提案。"""
+    outcome = {}
+
+    def late_create():
+        r = create_proposal(client, five_users["alice"], BODY, WITNESSES,
+                            deadline=in_seconds(1.0))
+        outcome["status"] = r.status_code
+        outcome["detail"] = r.json().get("detail")
+
+    with held_write_lock():
+        t = threading.Thread(target=late_create)
+        t.start()
+        time.sleep(1.5)  # 持有写锁直至越过 1.0s 的确认截止时刻
+    t.join(10)
+
+    assert outcome["status"] == 400
+    assert outcome["detail"] == "确认截止时刻必须晚于当前时间"
+    # 整体回滚：提案与见证名单都不落库
+    import sqlite3
+    conn = sqlite3.connect(os.environ["SEAL_DB_PATH"])
+    assert conn.execute("SELECT COUNT(*) FROM pre_seal_proposals").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM pre_seal_witnesses").fetchone()[0] == 0
+    conn.close()
+
+
+def test_third_vote_waiting_past_deadline_expires_without_document(
+    client, five_users, no_sweeper
+):
+    """第三票在截止前发起、取得写锁时截止已过：先失效并清空正文，再 409，
+    不计新票、不生成资料或封存审计。"""
+    pid = create_proposal(client, five_users["alice"], BODY, WITNESSES,
+                          deadline=in_seconds(1.2)).json()["proposal_id"]
+    dg = digest_of(BODY)
+    confirm(client, five_users["bob"], pid, dg)
+    confirm(client, five_users["carol"], pid, dg)
+
+    outcome = {}
+
+    def late_third_vote():
+        r = confirm(client, five_users["dave"], pid, dg)
+        outcome["status"] = r.status_code
+        outcome["detail"] = r.json().get("detail")
+
+    with held_write_lock():
+        t = threading.Thread(target=late_third_vote)
+        t.start()
+        time.sleep(1.5)  # 第三票等待写锁期间越过 1.2s 的截止时刻
+    t.join(10)
+
+    assert outcome["status"] == 409
+    assert outcome["detail"] == "预封存提案已过确认截止时刻，确认被拒绝"
+    # 提案已失效、不计新票、未生成资料
+    data = get_proposal(client, five_users["alice"], pid).json()
+    assert data["status"] == "expired"
+    assert data["confirmation_count"] == 2
+    assert data["document_id"] is None
+    import sqlite3
+    conn = sqlite3.connect(os.environ["SEAL_DB_PATH"])
+    # 正文已清空；无资料、无封存审计
+    assert conn.execute("SELECT body FROM pre_seal_proposals WHERE id=?",
+                        (pid,)).fetchone()[0] == ""
+    assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM audit_log WHERE action='seal'").fetchone()[0] == 0
+    conn.close()
+
+
+def test_revoke_waiting_past_deadline_expires_instead(client, five_users, no_sweeper):
+    """撤回在截止前发起、取得写锁时截止已过：先失效并清空正文，再 409。"""
+    pid = create_proposal(client, five_users["alice"], BODY, WITNESSES,
+                          deadline=in_seconds(1.2)).json()["proposal_id"]
+
+    outcome = {}
+
+    def late_revoke():
+        r = revoke(client, five_users["alice"], pid)
+        outcome["status"] = r.status_code
+        outcome["detail"] = r.json().get("detail")
+
+    with held_write_lock():
+        t = threading.Thread(target=late_revoke)
+        t.start()
+        time.sleep(1.5)  # 撤回等待写锁期间越过 1.2s 的截止时刻
+    t.join(10)
+
+    assert outcome["status"] == 409
+    assert outcome["detail"] == "预封存提案已过确认截止时刻，不能撤回"
+    # 到期失效优先于撤回
+    assert get_proposal(client, five_users["alice"], pid).json()["status"] == "expired"
+    import sqlite3
+    conn = sqlite3.connect(os.environ["SEAL_DB_PATH"])
+    assert conn.execute("SELECT body FROM pre_seal_proposals WHERE id=?",
+                        (pid,)).fetchone()[0] == ""
+    conn.close()
+
+
+def test_third_vote_lock_acquired_before_deadline_creates_document(
+    client, five_users, no_sweeper
+):
+    """截止前取得写锁的有效第三票：仍在同一事务生成唯一资料，
+    完成时刻取取得写锁后的实际时刻（不早于写锁释放时刻）。"""
+    pid = create_proposal(client, five_users["alice"], BODY, WITNESSES,
+                          deadline=in_seconds(5)).json()["proposal_id"]
+    dg = digest_of(BODY)
+    confirm(client, five_users["bob"], pid, dg)
+    confirm(client, five_users["carol"], pid, dg)
+
+    outcome = {}
+
+    def third_vote():
+        r = confirm(client, five_users["dave"], pid, dg)
+        outcome["status"] = r.status_code
+        outcome["json"] = r.json() if r.status_code == 200 else None
+
+    with held_write_lock():
+        t = threading.Thread(target=third_vote)
+        t.start()
+        time.sleep(0.5)  # 写锁在截止前释放，第三票取锁时截止未过
+        release_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds")
+    t.join(10)
+
+    assert outcome["status"] == 200
+    data = outcome["json"]
+    assert data["status"] == "confirmed"
+    assert data["confirmation_count"] == 3
+    doc_id = data["document_id"]
+    assert isinstance(doc_id, int)
+    # 完成时刻为取得写锁后的实际时刻，不早于写锁释放时刻
+    assert data["resolved_at"] >= release_at
+    # 同一事务生成唯一一份资料；已完成提案的重复请求不再生成资料
+    import sqlite3
+    conn = sqlite3.connect(os.environ["SEAL_DB_PATH"])
+    assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM audit_log WHERE document_id=? AND action='seal'",
+        (doc_id,)).fetchone()[0] == 1
+    conn.close()
+    assert confirm(client, five_users["dave"], pid, dg).status_code == 409

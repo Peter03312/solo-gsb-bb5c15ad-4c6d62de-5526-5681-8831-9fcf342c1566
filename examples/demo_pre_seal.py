@@ -10,6 +10,10 @@
 4) 三人截止前确认后，在第三票事务内生成一份普通封存资料并返回资料编号；
    已完成提案的重复请求不再生成资料；生成的资料沿用现有两票开封流程；
 5) 发起人完成前撤回；截止时未集齐即失效；撤回/失效/完成后提案正文清空。
+   截止判定以取得写事务后的实际时刻为准：在截止前到达、等待写锁期间越过
+   截止时刻的发起/确认/撤回，分别按 400（不落提案）/409（先失效清正文，
+   不计票、不生成资料）拒绝；截止前取得写锁的有效第三票仍在同一事务
+   生成唯一资料。
 
 用法: python examples/demo_pre_seal.py [base_url]
 """
@@ -173,9 +177,13 @@ def main() -> None:
     status, exp = call("GET", f"/pre-seal-proposals/{pid3}", alice)
     show("到期后查询（扫描器已失效）", status, exp)
     assert exp["status"] == "expired"
+    # 截止判定以取得写事务后的实际时刻为准：迟到确认一律 409，
+    # 不计票、不生成资料（document_id 保持为空）
     assert call("POST", f"/pre-seal-proposals/{pid3}/confirmations", carol,
                 {"digest": dg3})[0] == 409
     assert call("POST", f"/pre-seal-proposals/{pid3}/revoke", alice)[0] == 409
+    _, exp2 = call("GET", f"/pre-seal-proposals/{pid3}", alice)
+    assert exp2["document_id"] is None and exp2["confirmation_count"] == 1
 
     print("预封存端到端示例全部通过 ✔")
 
