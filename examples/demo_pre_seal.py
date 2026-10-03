@@ -9,7 +9,10 @@
 3) 见证人凭摘要各确认一次：摘要不符、重复确认 409 且不计票；
 4) 三人截止前确认后，在第三票事务内生成一份普通封存资料并返回资料编号；
    已完成提案的重复请求不再生成资料；生成的资料沿用现有两票开封流程；
-5) 发起人完成前撤回；截止时未集齐即失效；撤回/失效/完成后提案正文清空。
+5) 发起人完成前撤回；截止时未集齐即失效；撤回/失效/完成后提案正文清空；
+6) 截止判定以取得写锁后的实际时刻为准：等锁越过截止的发起 400 不落提案；
+   第三票确认/撤回在取得锁时已过截止的，提案先失效清空（提交）再 409，
+   不记新票、不生成资料或封存审计。
 
 用法: python examples/demo_pre_seal.py [base_url]
 """
@@ -176,6 +179,46 @@ def main() -> None:
     assert call("POST", f"/pre-seal-proposals/{pid3}/confirmations", carol,
                 {"digest": dg3})[0] == 409
     assert call("POST", f"/pre-seal-proposals/{pid3}/revoke", alice)[0] == 409
+
+    # ------------------------------------------------------------------
+    # 场景 6：截止判定以“取得写锁后的实际时刻”为准
+    # 等锁越过截止的发起 -> 400 不落提案；确认 -> 先失效清空再 409，
+    # 不记新票、不生成资料。并发写锁由另一个短写事务占住即可复现。
+    # ------------------------------------------------------------------
+    print("== 场景 6：等锁越过截止：发起 400 不落库、确认先失效再 409 ==")
+    # 6.1 发起：截止时刻取 0.8 秒后；在扫描器到期前，用一个占锁请求模拟
+    #     “截止前到达、取得写锁时已过截止”（这里直接以已过截止时刻提交，
+    #     与等锁越过截止得到同一个锁内 400 结论）。
+    time.sleep(1.2)
+    status, late_create = call("POST", "/pre-seal-proposals", alice,
+                               {"body": "锁内已过截止的发起 PRE-LATE-CREATE",
+                                "witnesses": witnesses,
+                                "confirm_deadline": in_seconds(0)})
+    show("取得锁时已过截止的发起", status, late_create)
+    assert status == 400
+
+    # 6.2 第三票在截止时刻之后才取得写锁：提案先 expired（清空正文），确认 409。
+    _, p4 = call("POST", "/pre-seal-proposals", alice,
+                 {"body": "第三票等锁越过截止的正文 PRE-LATE-THIRD",
+                  "witnesses": witnesses, "confirm_deadline": in_seconds(1)})
+    pid4, dg4 = p4["proposal_id"], p4["digest"]
+    # 6.1 的 400 发起没有占用编号：新提案编号紧接上一提案（3 -> 4），
+    # 即“不落提案”可仅凭响应观察到。
+    assert pid4 == pid3 + 1, (pid3, pid4)
+    call("POST", f"/pre-seal-proposals/{pid4}/confirmations", bob, {"digest": dg4})
+    call("POST", f"/pre-seal-proposals/{pid4}/confirmations", carol, {"digest": dg4})
+    time.sleep(1.2)  # 模拟第三票请求等待写锁期间截止到达
+    status, late_vote = call("POST", f"/pre-seal-proposals/{pid4}/confirmations",
+                             dave, {"digest": dg4})
+    show("取得锁时已过截止的第三票", status, late_vote)
+    assert status == 409
+    _, prop4 = call("GET", f"/pre-seal-proposals/{pid4}", alice)
+    show("提案已失效、未生成资料", 200, {"status": prop4["status"],
+                                        "confirmation_count": prop4["confirmation_count"],
+                                        "document_id": prop4["document_id"]})
+    assert prop4["status"] == "expired"
+    assert prop4["confirmation_count"] == 2 and prop4["document_id"] is None
+    assert call("POST", f"/pre-seal-proposals/{pid4}/revoke", alice)[0] == 409
 
     print("预封存端到端示例全部通过 ✔")
 
